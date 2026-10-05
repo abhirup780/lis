@@ -8,11 +8,12 @@ import argparse
 import random
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, utcnow
 from app.models import (
+    Counter,
     Department,
     Order,
     Panel,
@@ -28,6 +29,7 @@ from app.models import (
 )
 from app.schemas import OrderCreate
 from app.security import hash_password
+from app.services.numbering import next_value
 from app.services.orders import create_order
 from app.services.results import record_result, verify_result
 from app.services.westgard import evaluate
@@ -238,6 +240,13 @@ def _differential(rng: random.Random) -> dict[str, str]:
 def _run_order(db: Session, order: Order, user: User, rng: random.Random, stage: str, abnormal: float, when, overrides=None):
     """Advance an order to a stage: ordered | collected | received | resulted | verified."""
     order.created_at = when
+    if when.date() != utcnow().date():
+        # Number backdated orders and tubes for the day they were placed.
+        day = when.strftime("%y%m%d")
+        order.order_number = f"ORD-{day}-{next_value(db, f'order-{day}'):04d}"
+        for s in order.specimens:
+            s.accession = f"{day}{next_value(db, f'accession-{day}'):04d}"
+            s.created_at = when
     if stage == "ordered":
         return
     for s in order.specimens:
@@ -298,6 +307,10 @@ def seed_demo(db: Session) -> None:
         for days_ago in (42, 21, 7):
             o = order(p, ["CMP", "CBCD"] if days_ago != 21 else ["BMP", "LIPID", "CBC"])
             _run_order(db, o, tech, rng, "verified", 0.12, now - timedelta(days=days_ago, hours=rng.randint(0, 8)))
+
+    # The history above was renumbered by date, so today's numbering can start at 1.
+    today = utcnow().strftime("%y%m%d")
+    db.execute(delete(Counter).where(Counter.name.in_([f"order-{today}", f"accession-{today}"])))
 
     # Today's workload in every stage.
     stages = ["ordered", "ordered", "collected", "verified", "received", "resulted", "resulted", "verified", "received", "resulted"]

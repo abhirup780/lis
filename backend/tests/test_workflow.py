@@ -340,3 +340,15 @@ def test_worklist(frontdesk, tech):
     heme = tech.get("/worklist", params={"department": "HEME"}).json()
     assert len(heme) == 1 and {r["test"]["code"] for r in heme[0]["results"]} >= {"WBC", "PLT"}
     assert tech.get("/worklist", params={"status": "review"}).json() == []
+
+
+def test_calculation_not_applicable_does_not_block_completion(frontdesk, tech):
+    child = make_patient(frontdesk, dob="2018-03-01")
+    order = make_order(frontdesk, child["id"], panels=["BMP"])
+    receive_all(frontdesk, order)
+    enter(tech, order, {"NA": "139", "K": "4.2", "CL": "103", "CO2": "24", "BUN": "12", "CREA": "0.45", "GLU": "88", "CA": "9.6"})
+    egfr = by_code(fetch(tech, order))["EGFR"]
+    assert egfr["status"] == "cancelled" and "Not calculated" in egfr["comment"]
+    measured = [t["id"] for t in order["tests"] if not t["test"]["is_calculated"]]
+    tech.post("/results/verify", json={"order_test_ids": measured})
+    assert fetch(tech, order)["status"] == "completed"

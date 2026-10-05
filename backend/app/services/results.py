@@ -22,7 +22,9 @@ from app.models import (
     User,
 )
 from app.services.audit import audit
-from app.services.calculations import calculate
+from app.services.calculations import CALCULATIONS, calculate
+
+NOT_CALCULABLE = "not_calculable"
 
 _NUMERIC = re.compile(r"^\s*([<>]=?)?\s*(-?\d+(?:\.\d+)?)\s*$")
 
@@ -236,7 +238,9 @@ def record_result(
 def update_calculated(db: Session, order: Order, user: User | None) -> None:
     patient = order.patient
     age_years = age_in_days(patient.date_of_birth, None) / 365.25
-    calculated = [t for t in order.tests if t.test.is_calculated and t.status != "cancelled"]
+    calculated = [
+        t for t in order.tests if t.test.is_calculated and (t.status != "cancelled" or t.source == NOT_CALCULABLE)
+    ]
     # Calculations can depend on other calculations (A/G ratio needs globulin), so
     # run passes until nothing changes.
     for _ in range(len(calculated) + 1):
@@ -249,7 +253,20 @@ def update_calculated(db: Session, order: Order, user: User | None) -> None:
         for ot in calculated:
             result = calculate(ot.test.calc_key, values, patient.sex, age_years)
             if result is None:
+                inputs_present = all(code in values for code in CALCULATIONS[ot.test.calc_key].inputs)
+                if inputs_present and ot.source != NOT_CALCULABLE:
+                    # E.g. eGFR for a child: report it as not calculated so the order can complete.
+                    if ot.status == "verified":
+                        _snapshot_history(db, ot, user, "Calculation no longer applies")
+                    ot.status = "cancelled"
+                    ot.source = NOT_CALCULABLE
+                    ot.value_text = ot.value_numeric = ot.flag = None
+                    ot.is_critical = False
+                    ot.comment = "Not calculated: the equation does not apply to this patient or these results"
+                    changed = True
                 continue
+            if ot.source == NOT_CALCULABLE:
+                ot.comment = None
             text = format_value(result, ot.test.decimals)
             if text == ot.value_text:
                 continue
@@ -303,8 +320,6 @@ def verify_result(db: Session, ot: OrderTest, user: User | None, auto: bool = Fa
 
 def _verify_ready_calculations(db: Session, order: Order) -> None:
     """A calculated result is verified once every result it is derived from is verified."""
-    from app.services.calculations import CALCULATIONS
-
     by_code = {t.test.code: t for t in order.tests if t.status != "cancelled"}
     for ot in list(by_code.values()):
         if not ot.test.is_calculated or ot.status != "resulted":
